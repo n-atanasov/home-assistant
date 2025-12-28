@@ -1,0 +1,179 @@
+blueprint:
+  name: Window/Door Heating Control
+  description: >-
+    Controls heating based on window/door state. Lowers temperature when windows/doors
+    are open for a configured delay, and restores to schedule when all are closed.
+    No external helper entities required.
+  domain: automation
+  source_url: https://github.com/n-atanasov/home-assistant/blob/main/blueprints/automation/window_door_heating_control.yaml
+  author: n-atanasov
+  input:
+    window_door_sensors:
+      name: Window/Door Sensors
+      description: Binary sensors that detect open windows/doors
+      selector:
+        entity:
+          domain: binary_sensor
+          multiple: true
+    climate_entity:
+      name: Climate Entity
+      description: The climate/thermostat entity to control
+      selector:
+        entity:
+          domain: climate
+    open_window_temperature:
+      name: Open Window Temperature
+      description: Temperature to set when windows/doors are open (°C)
+      default: 10
+      selector:
+        number:
+          min: 5
+          max: 20
+          step: 0.5
+          unit_of_measurement: "°C"
+    delay_seconds:
+      name: Delay (seconds)
+      description: Seconds to wait before lowering temperature after window/door opens
+      default: 60
+      selector:
+        number:
+          min: 0
+          max: 3600
+          step: 1
+          unit_of_measurement: "s"
+    notify_device:
+      name: Devices to Notify
+      description: Select the mobile devices to receive notifications
+      default: []
+      selector:
+        device:
+          filter:
+            - integration: mobile_app
+          multiple: true
+    zone_name:
+      name: Zone Name
+      description: Name of the zone (for notifications and logging)
+      selector:
+        text:
+
+trigger:
+  - platform: state
+    entity_id: !input window_door_sensors
+    to: "on"
+    id: opened
+  - platform: state
+    entity_id: !input window_door_sensors
+    to: "off"
+    id: closed
+
+variables:
+  window_door_sensors: !input window_door_sensors
+  climate_entity: !input climate_entity
+  open_window_temperature: !input open_window_temperature
+  delay_seconds: !input delay_seconds
+  zone_name: !input zone_name
+  notify_device_raw: !input notify_device
+  notify_devices: >
+    {% if notify_device_raw is iterable and notify_device_raw is not string %}
+      {{ notify_device_raw }}
+    {% else %}
+      {{ [notify_device_raw] }}
+    {% endif %}
+  current_temp: "{{ state_attr(climate_entity, 'temperature') | float(0) }}"
+  any_open: >
+    {% set ns = namespace(found=false) %}
+    {% for sensor in window_door_sensors %}
+      {% if states(sensor) == 'on' %}
+        {% set ns.found = true %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.found }}
+  all_closed: >
+    {% set ns = namespace(closed=true) %}
+    {% for sensor in window_door_sensors %}
+      {% if states(sensor) != 'off' %}
+        {% set ns.closed = false %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.closed }}
+
+action:
+  - choose:
+      # Path 1: Window/Door opened - Lower heating
+      - conditions:
+          - condition: trigger
+            id: opened
+        sequence:
+          - alias: Wait for configured delay
+            delay:
+              seconds: "{{ delay_seconds | int }}"
+          
+          - alias: Verify window/door still open after delay
+            condition: template
+            value_template: >
+              {% set ns = namespace(found=false) %}
+              {% for sensor in window_door_sensors %}
+                {% if states(sensor) == 'on' %}
+                  {% set ns.found = true %}
+                {% endif %}
+              {% endfor %}
+              {{ ns.found }}
+          
+          - alias: Check if already at open window temperature
+            condition: template
+            value_template: "{{ (current_temp - open_window_temperature | float) | abs > 0.5 }}"
+          
+          - alias: Lower heating temperature
+            service: climate.set_temperature
+            target:
+              entity_id: !input climate_entity
+            data:
+              temperature: "{{ open_window_temperature }}"
+              hvac_mode: heat
+          
+          - service: system_log.write
+            data:
+              message: "{{ zone_name }}: Window/door open - heating set to {{ open_window_temperature }}°C"
+              level: info
+          
+          - alias: Send notification to each device
+            repeat:
+              for_each: "{{ notify_devices }}"
+              sequence:
+                - service: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}
+                  data:
+                    title: "🔧 Heating - {{ zone_name }}"
+                    message: >-
+                      A window/door has been open for more than {{ delay_seconds | int }} second(s).
+                      Heating set to {{ open_window_temperature }}°C
+      
+      # Path 2: All windows/doors closed - Restore heating
+      - conditions:
+          - condition: trigger
+            id: closed
+          - condition: template
+            value_template: "{{ all_closed }}"
+        sequence:
+          - alias: Restore heating to schedule
+            service: climate.set_preset_mode
+            target:
+              entity_id: !input climate_entity
+            data:
+              preset_mode: schedule
+          
+          - service: system_log.write
+            data:
+              message: "{{ zone_name }}: All windows/doors closed. Mode set back to schedule."
+              level: info
+          
+          - alias: Send notification to each device
+            repeat:
+              for_each: "{{ notify_devices }}"
+              sequence:
+                - service: notify.mobile_app_{{ device_attr(repeat.item, 'name') | slugify }}
+                  data:
+                    title: "🔧 Heating - {{ zone_name }}"
+                    message: "All windows/doors closed. Heating setting restored to Schedule."
+
+mode: single
+
