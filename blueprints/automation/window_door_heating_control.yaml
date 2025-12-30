@@ -59,11 +59,15 @@ blueprint:
 trigger:
   - platform: state
     entity_id: !input window_door_sensors
+    from: "off"
     to: "on"
     id: opened
   - platform: state
     entity_id: !input window_door_sensors
+    from: "on"
     to: "off"
+    for:
+      seconds: 3
     id: closed
 
 variables:
@@ -176,4 +180,3 @@ action:
                     message: "All windows/doors closed. Heating setting restored to Schedule."
 
 mode: single
-
